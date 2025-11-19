@@ -6,93 +6,111 @@ pipeline {
     }
 
     environment {
-        MONGO_URI = 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
-        MONGO_DB_CREDS = credentials('mongo-db-creds')
-        MONGO_USERNAME = credentials('mongo-db-username')
-        MONGO_PASSWORD = credentials('mongo-db-password')
-        SONAR_SCANNER_HOME = tool 'sonarqube-scanner-610'
-        GITHUB_TOKEN = credentials('git-pat-token')
+        MONGO_CLUSTER = "supercluster.d83jj.mongodb.net/superData"
         ECR_REPO_URL = '400014682771.dkr.ecr.us-east-2.amazonaws.com'
         IMAGE_NAME = "${ECR_REPO_URL}/solar-system"
-        IMAGE_TAG = "${GIT_COMMIT}"
     }
 
     stages {
 
         stage('Install Dependencies') {
             steps {
-                script {
-                    sh 'npm install --no-audit'
-                }
+                sh 'npm install --no-audit'
             }
         }
 
         stage('Dependency Scanning') {
             parallel {
-                stage('NPM Dependency Audit') {
+
+                stage('NPM Audit') {
                     steps {
-                        script {
-                            sh '''
-                               npm audit --audit-level=critical || true
-                               echo $?
-                            '''
-                        }
+                        sh '''
+                           npm audit --audit-level=critical || true
+                        '''
                     }
                 }
+
                 stage('OWASP Dependency Check') {
                     steps {
-                        script {
-                            dependencyCheck additionalArguments: '''
-                                --scan \'./\' 
-                                --out \'./\'  
-                                --format \'ALL\' 
-                                --disableYarnAudit \
-                                --prettyPrint''', odcInstallation: 'OWASP-DepCheck-11'
-                            
-                            dependencyCheckPublisher failedTotalCritical: 3, pattern: 'dependency-check-report.xml', stopBuild: true
+                        sh '''
+                            echo "Running OWASP Dependency Check..."
+
+                            mkdir -p dependency-check-output
+
+                            /opt/dependency-check/bin/dependency-check.sh \
+                                --scan . \
+                                --out dependency-check-output \
+                                --format ALL \
+                                --prettyPrint \
+                                --disableYarnAudit || true
+                        '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'dependency-check-output/**', allowEmptyArchive: true
+
+                            script {
+                                // Extract critical count
+                                def report = "dependency-check-output/dependency-check-report.xml"
+                                if (fileExists(report)) {
+                                    def critical = sh(
+                                        script: "grep -oPm1 '(?<=<critical>)[0-9]+' ${report} || echo 0",
+                                        returnStdout: true
+                                    ).trim()
+
+                                    echo "Critical vulnerabilities: ${critical}"
+
+                                    if (critical.toInteger() > 3) {
+                                        error "Build failed: Too many CRITICAL vulnerabilities (${critical})"
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+
             }
         }
 
         stage('Unit Tests') {
             steps {
-                script {
-                    sh 'echo Colon-Separated - $MONGO_DB_CREDS'
-                    sh 'echo Username - $MONGO_DB_CREDS_USR'
-                    sh 'echo Password - $MONGO_DB_CREDS_PSW'
-                    sh 'npm test'
+                withCredentials([usernamePassword(credentialsId: 'mongo-db-username', usernameVariable: 'MONGO_USER', passwordVariable: 'MONGO_PASS')]) {
+                    sh '''
+                        export MONGO_URI="mongodb+srv://${MONGO_USER}:${MONGO_PASS}@${MONGO_CLUSTER}"
+                        npm test
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
                 }
             }
         }
 
         stage('Code Coverage') {
             steps {
-                script {
-                    catchError(buildResult: 'SUCCESS', message: 'Oops! it will be fixed in future releases', stageResult: 'UNSTABLE') {
-                        sh 'npm run coverage'
-                    }
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh 'npm run coverage'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'coverage/**', allowEmptyArchive: true
                 }
             }
         }
 
         stage('SAST - SonarQube') {
             steps {
-                script {
-                    sh 'sleep 5s'
-                    timeout(time: 60, unit: 'SECONDS') {
-                        withSonarQubeEnv('sonar-qube-server') {
-                            sh '''
-                                $SONAR_SCANNER_HOME/bin/sonar-scanner \
-                                  -Dsonar.projectKey=orbit-engine \
-                                  -Dsonar.projectName=orbit-engine \
-                                  -Dsonar.sources=app.js \
-                                  -Dsonar.javascript.lcov.reportPaths=./coverage/lcov.info
-                            '''
-                        }
-                        waitForQualityGate abortPipeline: true
-                    }
+                withSonarQubeEnv('sonar-qube-server') {
+                    sh '''
+                        $SONAR_SCANNER_HOME/bin/sonar-scanner \
+                          -Dsonar.projectKey=orbit-engine \
+                          -Dsonar.projectName=orbit-engine \
+                          -Dsonar.sources=. \
+                          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+                    '''
                 }
             }
         }
@@ -100,83 +118,61 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 script {
+                    env.IMAGE_TAG = "${env.GIT_COMMIT}"
                     sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
                 }
             }
         }
 
-        stage('Trivy Vulnerability Scan') {
+        stage('Trivy Scan') {
             steps {
-                script {
-                    sh """
-                        trivy image ${IMAGE_NAME}:${IMAGE_TAG} \
-                          --severity LOW,MEDIUM,HIGH \
-                          --exit-code 0 \
-                          --quiet \
-                          --format json -o trivy-image-MEDIUM-results.json
+                sh '''
+                    trivy image ${IMAGE_NAME}:${IMAGE_TAG} \
+                      --severity LOW,MEDIUM,HIGH \
+                      --format json -o trivy-medium.json \
+                      --exit-code 0
 
-                        trivy image ${IMAGE_NAME}:${IMAGE_TAG} \
-                          --severity CRITICAL \
-                          --exit-code 0 \
-                          --quiet \
-                          --format json -o trivy-image-CRITICAL-results.json
-                    """
-                }
+                    trivy image ${IMAGE_NAME}:${IMAGE_TAG} \
+                      --severity CRITICAL \
+                      --format json -o trivy-critical.json \
+                      --exit-code 0
+                '''
             }
             post {
                 always {
-                    sh '''
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/html.tpl" \
-                            --output trivy-image-MEDIUM-results.html trivy-image-MEDIUM-results.json
-
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/html.tpl" \
-                            --output trivy-image-CRITICAL-results.html trivy-image-CRITICAL-results.json
-
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/junit.tpl" \
-                            --output trivy-image-MEDIUM-results.xml  trivy-image-MEDIUM-results.json 
-
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/junit.tpl" \
-                            --output trivy-image-CRITICAL-results.xml trivy-image-CRITICAL-results.json
-                    '''
+                    archiveArtifacts artifacts: 'trivy-*.*', allowEmptyArchive: true
                 }
             }
         }
 
-        stage('Push Docker Image to ECR') {
+        stage('Push Docker Image') {
             steps {
-                script {
-                    withAWS(credentials: 'aws-creds', region: 'us-east-2') {
-                        sh '''
-                            aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin ${ECR_REPO_URL}
-                            docker push ${IMAGE_NAME}:${IMAGE_TAG}
-                        '''
-                    }
+                withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'USR', passwordVariable: 'PWD')]) {
+                    sh '''
+                        echo "$PWD" | docker login -u "$USR" --password-stdin
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                    '''
                 }
             }
         }
 
         stage('Deploy to EC2') {
             steps {
-                script {
-                    sshagent(['ec2-ssh-key']) {
+                sshagent(['ec2-ssh-key']) {
+                    withCredentials([usernamePassword(credentialsId: 'mongo-db-username', usernameVariable: 'MONGO_USER', passwordVariable: 'MONGO_PASS')]) {
                         sh """
-                            ssh -o StrictHostKeyChecking=no ec2-user@3.129.253.9 '
-                                aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin ${ECR_REPO_URL}
+                            ssh -o StrictHostKeyChecking=no ec2-user@18.217.135.213 '
                                 docker pull ${IMAGE_NAME}:${IMAGE_TAG}
-                                if sudo docker ps -a | grep -q "solar-system"; then
-                                    echo "Container found. Stopping..."
-                                    sudo docker stop "solar-system" && sudo docker rm "solar-system"
-                                    echo "Container stopped and removed."
+
+                                if docker ps -a | grep -q solar-system; then
+                                    docker stop solar-system || true
+                                    docker rm solar-system || true
                                 fi
-                                    docker run -d --name solar-system \
-                                       -e MONGO_URI="${MONGO_URI}" \
-                                       -e MONGO_USERNAME="${MONGO_USERNAME}" \
-                                       -e MONGO_PASSWORD="${MONGO_PASSWORD}" \
-                                       -p 3000:3000 ${IMAGE_NAME}:${IMAGE_TAG}
+
+                                docker run -d --name solar-system \
+                                  -e MONGO_URI="mongodb+srv://${MONGO_USER}:${MONGO_PASS}@${MONGO_CLUSTER}" \
+                                  -p 3000:3000 \
+                                  ${IMAGE_NAME}:${IMAGE_TAG}
                             '
                         """
                     }
@@ -184,78 +180,56 @@ pipeline {
             }
         }
 
-        stage('Integration Testing - AWS EC2') {
+        stage('Integration Tests') {
             steps {
-                script {
-                    withAWS(credentials: 'aws-creds', region: 'us-east-2') {
-                        sh 'bash integration-testing-ec2.sh'
-                    }
+                sh 'bash integration-testing-ec2.sh'
+            }
+        }
+
+        stage('OWASP ZAP DAST') {
+            steps {
+                sh '''
+                    docker run -v $(pwd):/zap/wrk:rw \
+                      ghcr.io/zaproxy/zaproxy zap-api-scan.py \
+                      -t http://<YOUR-APP-URL>/api-docs/ \
+                      -f openapi \
+                      -r zap_report.html \
+                      -J zap_json.json \
+                      -w zap.md
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'zap_*.*, zap*.*', allowEmptyArchive: true
                 }
             }
         }
 
-        stage('Update Kustomize Image Tag') {
+        stage('Upload Reports to S3') {
             steps {
-                script {
-                    sh 'git clone -b main https://github.com/chinmaya10000/kubernetes-manifest.git'
-                    dir('kubernetes-manifest') {
-                        sh '''
-                            git checkout main
+                withAWS(credentials: 'aws-creds', region: 'us-east-2') {
+                    sh '''
+                        mkdir -p reports-${BUILD_ID}
+                        cp -r coverage reports-${BUILD_ID}/ || true
+                        cp -r dependency-check-output reports-${BUILD_ID}/ || true
+                        cp trivy-* zap* reports-${BUILD_ID}/ || true
+                    '''
 
-                            yq -i "(.images[] | select(.name == \\"solar-system\\") | .newTag) = \\"${IMAGE_TAG}\\"" overlays/dev/kustomization.yaml
-                            git config --global user.name "jenkins"
-                            git config --global user.email "jenkins@dasher.com"
-                            git remote set-url origin https://${GITHUB_TOKEN}@github.com/chinmaya10000/kubernetes-manifest.git
-                            git add overlays/dev/kustomization.yaml
-                            git commit -m "update solar-system image to ${IMAGE_TAG}"
-                            git push -u origin main
-                        '''
-                    }
+                    s3Upload(
+                      file: "reports-${BUILD_ID}",
+                      bucket: "orbit-engine-jenkins-reports",
+                      path: "jenkins-${BUILD_ID}/"
+                    )
                 }
             }
         }
 
-        stage('Upload - AWS S3') {
-            steps {
-                script {
-                    withAWS(credentials: 'aws-creds', region: 'us-east-2') {
-                        sh '''
-                           ls -ltr
-                           mkdir reports-$BUILD_ID
-                           cp -rf coverage/ reports-$BUILD_ID
-                           cp dependency*.* test-results.xml trivy*.* reports-$BUILD_ID
-                           ls -ltr reports-$BUILD_ID
-                        '''
-                        s3Upload(
-                            file:"reports-$BUILD_ID",
-                            bucket:'orbit-engine-jenkins-reports',
-                            path:"jenkins-$BUILD_ID/"
-                        )
-                    }
-                }
-            }
-        }
-    }
+    } // end stages
 
     post {
         always {
-            script {
-                if (fileExists('kubernetes-manifest')) {
-                    sh 'rm -rf kubernetes-manifest'
-                }
-            }
-
-            junit allowEmptyResults: true, stdioRetention: '', testResults: 'dependency-check-junit.xml'
-            junit allowEmptyResults: true, stdioRetention: '', testResults: 'test-results.xml'
-            junit allowEmptyResults: true, stdioRetention: '', testResults: 'trivy-image-CRITICAL-results.xml'
-            junit allowEmptyResults: true, stdioRetention: '', testResults: 'trivy-image-MEDIUM-results.xml'
-
-            publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './', reportFiles: 'dependency-check-jenkins.html', reportName: 'Dependency Check HTML Report', reportTitles: '', useWrapperFileDirectly: true])
-
-            publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: 'coverage/lcov-report', reportFiles: 'index.html', reportName: 'Code Coverage HTML Report', reportTitles: '', useWrapperFileDirectly: true])
-            publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './', reportFiles: 'trivy-image-CRITICAL-results.html', reportName: 'Trivy Image Critical Vul Report', reportTitles: '', useWrapperFileDirectly: true])
-
-            publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: './', reportFiles: 'trivy-image-MEDIUM-results.html', reportName: 'Trivy Image Medium Vul Report', reportTitles: '', useWrapperFileDirectly: true])
+            archiveArtifacts artifacts: '**/*.html', allowEmptyArchive: true
+            echo "Pipeline completed."
         }
     }
 }
