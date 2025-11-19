@@ -39,7 +39,7 @@ pipeline {
                 stage('OWASP Dependency Check') {
                     steps {
                         script {
-                            dependencyCheck additionalArguments: '''
+                            dependencyCheck additionalArguments:
                                run: |
   /tmp/dependency-check/bin/dependency-check.sh \
     --scan . \
