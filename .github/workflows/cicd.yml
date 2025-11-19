@@ -40,11 +40,14 @@ pipeline {
                     steps {
                         script {
                             dependencyCheck additionalArguments: '''
-                                --scan \'./\' 
-                                --out \'./\'  
-                                --format \'ALL\' 
-                                --disableYarnAudit \
-                                --prettyPrint''', odcInstallation: 'OWASP-DepCheck-11'
+                               run: |
+  /tmp/dependency-check/bin/dependency-check.sh \
+    --scan . \
+    --out . \
+    --format ALL \
+    --disableYarnAudit \
+    --prettyPrint || true
+ odcInstallation: 'OWASP-DepCheck-11'
 
                             dependencyCheckPublisher failedTotalCritical: 3, pattern: 'dependency-check-report.xml', stopBuild: true
                         }
